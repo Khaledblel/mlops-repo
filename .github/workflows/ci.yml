@@ -1,0 +1,87 @@
+# Nom affiché dans l'onglet Actions de GitHub
+name: CI churn
+
+# Quand le workflow se déclenche : à chaque push sur develop ou sur une branche de TP,
+# et à chaque pull request vers develop
+on:
+  push:
+    branches: ["develop", "TP**"]
+  pull_request:
+    branches: ["develop"]
+
+jobs:
+
+  # ----- Job 1 : entraîner le modèle et lancer les tests -----
+  tests:
+    # runner : machine Linux fournie par GitHub, détruite à la fin du job
+    runs-on: ubuntu-latest
+
+    steps:
+      # récupérer le code du dépôt sur le runner
+      - uses: actions/checkout@v4
+
+      # installer Python 3.11 (même version que notre Dockerfile) et mettre pip en cache
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Installer les bibliothèques
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Entraîner le modèle
+        run: python entrainer_ci.py
+
+      - name: Lancer les tests
+        run: pytest test_ci.py -v
+
+      # le dossier model/ n'est pas dans Git : on le garde pour le job suivant
+      - name: Conserver le modèle
+        uses: actions/upload-artifact@v4
+        with:
+          name: modele
+          path: model/
+
+  # ----- Job 2 : construire l'image Docker (et la publier depuis develop) -----
+  image:
+    # needs : ce job ne démarre que si le job « tests » est vert
+    needs: tests
+    runs-on: ubuntu-latest
+
+    # droits donnés au jeton automatique : lire le code, écrire dans GHCR
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # récupérer le modèle produit par le job « tests »
+      - uses: actions/download-artifact@v4
+        with:
+          name: modele
+          path: model
+
+      # nom de l'image : ghcr.io/<compte en minuscules>/churn-api
+      - name: Calculer le nom de l'image
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE=ghcr.io/$OWNER/churn-api" >> "$GITHUB_ENV"
+
+      - name: Construire l'image
+        run: docker build -t $IMAGE:latest -t $IMAGE:${{ github.sha }} .
+
+      # les deux étapes suivantes ne s'exécutent que sur la branche develop
+      - name: Se connecter à GHCR
+        if: github.ref == 'refs/heads/develop'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publier l'image
+        if: github.ref == 'refs/heads/develop'
+        run: |
+          docker push $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }}
